@@ -1,6 +1,10 @@
 Server/styledecor-45ebb-firebase-adminsdk-fbsvc-2cb7ac5bb5.json
 Server/node_modules
-Server/.env
+.env
 *.json
 !package.json
+node_modules/
+
 !package-lock.json
+
+styledecor-45ebb-firebase-adminsdk-fbsvc-2cb7ac5bb5.json
