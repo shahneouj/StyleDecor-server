@@ -15,7 +15,7 @@ app.use(
       "http://localhost:3000", // CRA (optional)
     ],
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -36,10 +36,6 @@ async function connectDB() {
 
     console.log("✅ Database connected");
 
-    // Initialize Firebase Admin SDK (multiple supported options):
-    // 1) FIREBASE_SERVICE_ACCOUNT (JSON string or base64-encoded JSON)
-    // 2) FIREBASE_SERVICE_ACCOUNT_PATH (path to JSON file)
-    // 3) local file fallback (styledecor...json)
     let firebaseInitialized = false;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -214,6 +210,83 @@ app.get("/decoration-services/:id", async (req, res) => {
     });
   }
 });
+
+// -----------------------------
+// Services (admin CRUD) — stored in 'decoration_service' collection
+// -----------------------------
+
+// Get all services (admin)
+app.get('/services', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const services = await db.collection('decoration_service').find().sort({ createdAt: -1 }).toArray();
+    res.status(200).json({ success: true, count: services.length, data: services });
+  } catch (err) {
+    console.error('Error fetching services:', err);
+    res.status(500).json({ success: false, message: 'Could not retrieve services' });
+  }
+});
+
+// Create a service (admin)
+app.post('/services', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { service_name, cost, unit, category, description } = req.body;
+    if (!service_name || cost === undefined || !unit || !category) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    const createdByEmail = req.user?.email || null;
+    const doc = {
+      name: service_name,
+      price: Number(cost),
+      short: unit,
+      category,
+      description: description || '',
+      createdByEmail,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection('decoration_service').insertOne(doc);
+    res.status(201).json({ success: true, insertedId: result.insertedId });
+  } catch (err) {
+    console.error('Error creating service:', err);
+    res.status(500).json({ success: false, message: 'Could not create service' });
+  }
+});
+
+// Patch service (admin)
+app.patch('/services/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+
+    const allowed = ['service_name', 'cost', 'unit', 'category', 'description'];
+    const setObj = {};
+    for (const k of allowed) if (update[k] !== undefined) setObj[k] = k === 'cost' ? Number(update[k]) : update[k];
+    if (Object.keys(setObj).length === 0) return res.status(400).json({ success: false, message: 'No valid fields to update' });
+    setObj.updatedAt = new Date();
+
+    const result = await db.collection('decoration_service').updateOne({ _id: new ObjectId(id) }, { $set: setObj });
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error('Error updating service:', err);
+    res.status(500).json({ success: false, message: 'Could not update service' });
+  }
+});
+
+// Delete service (admin)
+app.delete('/services/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+    const result = await db.collection('decoration_service').deleteOne({ _id: new ObjectId(id) });
+    res.status(200).json({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('Error deleting service:', err);
+    res.status(500).json({ success: false, message: 'Could not delete service' });
+  }
+});
 // Create a payment
 app.post("/payments", async (req, res) => {
   try {
@@ -235,6 +308,9 @@ app.post("/payments", async (req, res) => {
 
     const paymentsCollection = db.collection("payments");
 
+    // Persist bookingDate if provided (expects YYYY-MM-DD string)
+    const bookingDate = payment.bookingDate ? String(payment.bookingDate) : null;
+
     const paymentData = {
       serviceId: new ObjectId(payment.serviceId),
       serviceName: payment.serviceName,
@@ -243,6 +319,7 @@ app.post("/payments", async (req, res) => {
       customerEmail: payment.customerEmail,
       phone: payment.phone,
       paymentMethod: payment.paymentMethod,
+      bookingDate, // stored as YYYY-MM-DD string or null
       status: "paid",
       createdAt: new Date(),
     };
@@ -287,10 +364,131 @@ app.get("/payments", async (req, res) => {
   }
 });
 
+
+app.get('/bookings/pending-assignment', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const bookings = await db.collection('payments').find({ status: 'paid', 'assignedDecorator.id': { $exists: false } }).sort({ createdAt: -1 }).toArray();
+    res.status(200).json({ success: true, count: bookings.length, data: bookings });
+  } catch (err) {
+    console.error('Error fetching pending bookings:', err);
+    res.status(500).json({ success: false, message: 'Could not retrieve pending bookings' });
+  }
+});
+
+app.patch('/bookings/:id/assign', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { decoratorId } = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid booking id' });
+    if (!decoratorId || !ObjectId.isValid(decoratorId)) return res.status(400).json({ success: false, message: 'Invalid decorator id' });
+
+    const decoratorsCollection = db.collection('decorators');
+    const decorator = await decoratorsCollection.findOne({ _id: new ObjectId(decoratorId) });
+    if (!decorator) return res.status(404).json({ success: false, message: 'Decorator not found' });
+
+    const bookingsCollection = db.collection('payments');
+    const updates = { assignedDecorator: { id: decorator._id, name: decorator.name, email: decorator.email }, assignedAt: new Date(), status: 'assigned', progress: 0, updatedAt: new Date() };
+    const result = await bookingsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updates }
+    );
+
+    // Return the updated booking so client can update UI without extra fetch
+    const updated = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    res.status(200).json({ success: true, result, updated });
+  } catch (err) {
+    console.error('Error assigning decorator:', err);
+    res.status(500).json({ success: false, message: 'Could not assign decorator' });
+  }
+});
+
+// Get bookings assigned to the current decorator
+app.get('/bookings/assigned', verifyToken, async (req, res) => {
+  try {
+    const email = req.user?.email;
+    if (!email) return res.status(401).json({ success: false, message: 'No authenticated user' });
+    const bookings = await db.collection('payments').find({ 'assignedDecorator.email': email }).sort({ createdAt: -1 }).toArray();
+    res.status(200).json({ success: true, count: bookings.length, data: bookings });
+  } catch (err) {
+    console.error('Error fetching assigned bookings:', err);
+    res.status(500).json({ success: false, message: 'Could not retrieve assigned bookings' });
+  }
+});
+
+// Update booking status (assigned decorator or admin can update)
+app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { status } = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid booking id' });
+    if (!status) return res.status(400).json({ success: false, message: 'Missing status' });
+
+    // normalize status and validate (accept hyphen or underscore)
+    status = String(status).trim().toLowerCase().replace(/-/g, '_');
+    const allowedStatuses = ['assigned', 'in_progress', 'completed', 'cancelled'];
+    if (!allowedStatuses.includes(status)) return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${allowedStatuses.join(', ')}` });
+
+    const bookingsCollection = db.collection('payments');
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+    const requesterEmail = (req.user?.email || '').toLowerCase();
+    // Allow if requester is assigned decorator or an admin
+    let allowed = false;
+    const assignedEmail = (booking.assignedDecorator?.email || '').toLowerCase();
+    if (assignedEmail && assignedEmail === requesterEmail) allowed = true;
+    else {
+      // check admin
+      const usersCollection = db.collection('users');
+      const user = await usersCollection.findOne({ email: requesterEmail });
+      if (user && user.role === 'admin') allowed = true;
+    }
+    if (!allowed) return res.status(403).json({ success: false, message: 'Not authorized to update this booking' });
+
+    const prevStatus = booking.status;
+
+    const updates = { status, statusUpdatedAt: new Date(), updatedAt: new Date() };
+
+    // Accept explicit progress percent (0-100) if provided
+    let progress = undefined;
+    if (req.body.progress !== undefined) {
+      const pnum = Number(req.body.progress);
+      if (!Number.isFinite(pnum) || pnum < 0 || pnum > 100) return res.status(400).json({ success: false, message: 'Invalid progress (must be 0-100)' });
+      progress = Math.round(pnum);
+      updates.progress = progress;
+    } else {
+      // set sensible defaults when status changes
+      if (status === 'assigned') updates.progress = 0;
+      else if (status === 'in_progress') updates.progress = booking?.progress ? booking.progress : 50;
+      else if (status === 'completed') updates.progress = 100;
+    }
+
+    if (status === 'completed') updates.completedAt = new Date();
+    if (status === 'in_progress' && !booking.startedAt) updates.startedAt = new Date();
+
+    console.log('Booking status update request:', { id, prevStatus, status, progress: updates.progress, requester: requesterEmail, assigned: assignedEmail });
+
+    const result = await bookingsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updates });
+
+    // Return the updated booking document for confirmation
+    const updated = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+
+    if (result.matchedCount === 0) {
+      console.warn('Booking status update did not match any documents:', { id });
+      return res.status(500).json({ success: false, message: 'Failed to update booking' });
+    }
+
+    res.status(200).json({ success: true, result, updated, prevStatus });
+  } catch (err) {
+    console.error('Error updating booking status:', err);
+    res.status(500).json({ success: false, message: 'Could not update booking status' });
+  }
+});
+
 // Create or update a user (upsert) — intended to be called after registration
 app.post('/users', async (req, res) => {
   try {
-    const { name, email, role = 'user', photoURL = null } = req.body;
+    const { name, email, role, photoURL = null } = req.body;
 
     // Basic validation
     if (!email) {
@@ -299,11 +497,15 @@ app.post('/users', async (req, res) => {
 
     const usersCollection = db.collection('users');
 
+    // If user exists, preserve their role; otherwise use provided role or default to 'user'
+    const existing = await usersCollection.findOne({ email });
+    const roleToUse = existing?.role ?? role ?? 'user';
+
     const userDoc = {
-      name: name || null,
+      name: name || existing?.name || null,
       email,
-      role,
-      photoURL,
+      role: roleToUse,
+      photoURL: photoURL || existing?.photoURL || null,
       updatedAt: new Date(),
     };
 
@@ -313,7 +515,7 @@ app.post('/users', async (req, res) => {
       { upsert: true }
     );
 
-    res.status(200).json({ success: true, result });
+    res.status(200).json({ success: true, result, role: roleToUse });
   } catch (err) {
     console.error('Error creating/updating user:', err);
     res.status(500).json({ success: false, message: 'Could not create/update user' });
@@ -361,6 +563,43 @@ app.put('/users/:email/role', verifyToken, async (req, res) => {
   }
 });
 
+// PATCH equivalent: update only partial fields like 'role' (preferred semantic)
+app.patch('/users/:email/role', verifyToken, async (req, res) => {
+  try {
+    const targetEmail = req.params.email;
+    const { role } = req.body;
+    if (!['user', 'decorator', 'admin'].includes(role)) {
+      return res.status(400).json({ success: false, message: 'Invalid role' });
+    }
+
+    let allowed = false;
+    if (req.headers['x-admin-secret'] && process.env.ADMIN_SECRET && req.headers['x-admin-secret'] === process.env.ADMIN_SECRET) {
+      allowed = true;
+    }
+
+    if (!allowed) {
+      const usersCollection = db.collection('users');
+      const requester = await usersCollection.findOne({ email: req.user.email });
+      if (requester && requester.role === 'admin') allowed = true;
+    }
+
+    if (!allowed) return res.status(403).json({ success: false, message: 'Admin privileges required' });
+
+    const usersCollection = db.collection('users');
+    // Only modify the 'role' field (partial update)
+    const result = await usersCollection.updateOne(
+      { email: targetEmail },
+      { $set: { role, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true }
+    );
+
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error('Error patching user role:', err);
+    res.status(500).json({ success: false, message: 'Could not update role' });
+  }
+});
+
 // Protect GET /users to admin requests only
 app.get('/users', verifyToken, requireAdmin, async (req, res) => {
   try {
@@ -397,6 +636,86 @@ app.get('/users/:email', async (req, res) => {
   } catch (err) {
     console.error('Error fetching user by email:', err);
     res.status(500).json({ success: false, message: 'Could not retrieve user' });
+  }
+});
+
+// -----------------------------
+// Decorators CRUD (admin only)
+// Collection: decorators
+// -----------------------------
+
+// Get top decorators (public)
+app.get('/decorators/top-decorators', async (req, res) => {
+  try {
+    const collection = db.collection('decorators');
+    const decorators = await collection.find({ active: true }).sort({ rating: -1 }).limit(10).toArray();
+    res.status(200).json({ success: true, count: decorators.length, data: decorators });
+  } catch (err) {
+    console.error('Error fetching top decorators:', err);
+    res.status(500).json({ success: false, message: 'Could not retrieve top decorators' });
+  }
+});
+
+// Get all decorators (admin)
+app.get('/decorators', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const decorators = await db.collection('decorators').find().sort({ createdAt: -1 }).toArray();
+    res.status(200).json({ success: true, count: decorators.length, data: decorators });
+  } catch (err) {
+    console.error('Error fetching decorators:', err);
+    res.status(500).json({ success: false, message: 'Could not retrieve decorators' });
+  }
+});
+
+// Create decorator (admin)
+app.post('/decorators', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, email, phone, specialties = [], bio = '', profileImage = null, rating = 0, active = true } = req.body;
+    if (!name || !email) return res.status(400).json({ success: false, message: 'Name and email are required' });
+
+    const collection = db.collection('decorators');
+    const doc = { name, email, phone: phone || null, specialties: Array.isArray(specialties) ? specialties : ('' + specialties).split(',').map(s=>s.trim()).filter(Boolean), bio, profileImage, rating: Number(rating) || 0, active: !!active, createdAt: new Date(), updatedAt: new Date() };
+    const result = await collection.insertOne(doc);
+    res.status(201).json({ success: true, insertedId: result.insertedId });
+  } catch (err) {
+    console.error('Error creating decorator:', err);
+    res.status(500).json({ success: false, message: 'Could not create decorator' });
+  }
+});
+
+// Patch decorator (admin) - partial update by id
+app.patch('/decorators/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = req.body;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+    // only allow these fields to be updated
+    const allowed = ['name','email','phone','specialties','bio','profileImage','rating','active'];
+    const setObj = {};
+    for (const k of allowed) if (update[k] !== undefined) setObj[k] = k === 'specialties' && typeof update[k] === 'string' ? update[k].split(',').map(s=>s.trim()).filter(Boolean) : update[k];
+    if (Object.keys(setObj).length === 0) return res.status(400).json({ success: false, message: 'No valid fields to update' });
+    setObj.updatedAt = new Date();
+
+    const collection = db.collection('decorators');
+    const result = await collection.updateOne({ _id: new ObjectId(id) }, { $set: setObj });
+    res.status(200).json({ success: true, result });
+  } catch (err) {
+    console.error('Error updating decorator:', err);
+    res.status(500).json({ success: false, message: 'Could not update decorator' });
+  }
+});
+
+// Delete decorator (admin)
+app.delete('/decorators/:id', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+    const collection = db.collection('decorators');
+    const result = await collection.deleteOne({ _id: new ObjectId(id) });
+    res.status(200).json({ success: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('Error deleting decorator:', err);
+    res.status(500).json({ success: false, message: 'Could not delete decorator' });
   }
 });
 
