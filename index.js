@@ -379,7 +379,7 @@ app.get("/payments/user", verifyToken, async (req, res) => {
     let filter = {};
     if (userFromDb.role !== "admin") {
       // Normal user - only see their own payments
-      filter = { userEmail: req.user.email };
+      filter = { customerEmail: req.user.email };
     }
     // If admin, filter is empty → return all payments
 
