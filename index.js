@@ -288,7 +288,7 @@ app.delete('/services/:id', verifyToken, requireAdmin, async (req, res) => {
   }
 });
 // Create a payment
-app.post("/payments", async (req, res) => {
+app.post("/payments", verifyToken, async (req, res) => {
   try {
     const payment = req.body;
 
@@ -341,7 +341,7 @@ app.post("/payments", async (req, res) => {
   }
 });
 // Get all payments
-app.get("/payments", async (req, res) => {
+app.get("/payments", verifyToken, requireAdmin, async (req, res) => {
   try {
     const payments = await db
       .collection("payments")
@@ -363,6 +363,45 @@ app.get("/payments", async (req, res) => {
     });
   }
 });
+// payment for the user
+
+app.get("/payments/user", verifyToken, async (req, res) => {
+  try {
+    const usersCollection = db.collection("users");
+    const userFromDb = await usersCollection.findOne({ email: req.user.email });
+
+    if (!userFromDb) {
+      return res.status(403).json({ success: false, message: "User not found" });
+    }
+
+    const paymentsCollection = db.collection("payments");
+
+    let filter = {};
+    if (userFromDb.role !== "admin") {
+      // Normal user - only see their own payments
+      filter = { userEmail: req.user.email };
+    }
+    // If admin, filter is empty → return all payments
+
+    const payments = await paymentsCollection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: payments.length,
+      data: payments,
+    });
+  } catch (err) {
+    console.error("Fetch payments error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Could not retrieve payments",
+    });
+  }
+});
+
 
 
 app.get('/bookings/pending-assignment', verifyToken, requireAdmin, async (req, res) => {
@@ -600,6 +639,7 @@ app.patch('/users/:email/role', verifyToken, async (req, res) => {
   }
 });
 
+
 // Protect GET /users to admin requests only
 app.get('/users', verifyToken, requireAdmin, async (req, res) => {
   try {
@@ -622,6 +662,108 @@ app.get('/users', async (req, res) => {
     res.status(500).json({ success: false, message: 'Could not retrieve users' });
   }
 });
+// user update
+
+app.patch('/users/:email', verifyToken, async (req, res) => {
+  try {
+    const targetEmail = req.params.email;
+    const requesterEmail = req.user.email;
+    const updates = req.body;
+
+    const usersCollection = db.collection('users');
+
+    // -------------------------------
+    // Allowed fields (normal users)
+    // -------------------------------
+    const allowedFields = ['name', 'phone', 'address', 'photoURL'];
+    const updateData = {};
+
+    allowedFields.forEach((field) => {
+      if (updates[field] !== undefined) {
+        updateData[field] = updates[field];
+      }
+    });
+
+    // -------------------------------
+    // Check admin permission for role update
+    // -------------------------------
+    if (updates.role) {
+      let allowed = false;
+
+      // Admin secret (server-to-server)
+      if (
+        req.headers['x-admin-secret'] &&
+        process.env.ADMIN_SECRET &&
+        req.headers['x-admin-secret'] === process.env.ADMIN_SECRET
+      ) {
+        allowed = true;
+      }
+
+      // Admin user check
+      if (!allowed) {
+        const requester = await usersCollection.findOne({ email: requesterEmail });
+        if (requester?.role === 'admin') allowed = true;
+      }
+
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          message: 'Admin privileges required to update role',
+        });
+      }
+
+      if (!['user', 'decorator', 'admin'].includes(updates.role)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid role',
+        });
+      }
+
+      updateData.role = updates.role;
+    }
+
+    // -------------------------------
+    // Ownership check (user can update only self)
+    // -------------------------------
+    if (requesterEmail !== targetEmail && !updateData.role) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only update your own profile',
+      });
+    }
+
+    // -------------------------------
+    // Perform partial update
+    // -------------------------------
+    const result = await usersCollection.updateOne(
+      { email: targetEmail },
+      {
+        $set: {
+          ...updateData,
+          email: targetEmail,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'User updated successfully',
+      result,
+    });
+  } catch (err) {
+    console.error('Error updating user:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Could not update user',
+    });
+  }
+});
+
 
 // Get single user by email
 app.get('/users/:email', async (req, res) => {
@@ -674,7 +816,7 @@ app.post('/decorators', verifyToken, requireAdmin, async (req, res) => {
     if (!name || !email) return res.status(400).json({ success: false, message: 'Name and email are required' });
 
     const collection = db.collection('decorators');
-    const doc = { name, email, phone: phone || null, specialties: Array.isArray(specialties) ? specialties : ('' + specialties).split(',').map(s=>s.trim()).filter(Boolean), bio, profileImage, rating: Number(rating) || 0, active: !!active, createdAt: new Date(), updatedAt: new Date() };
+    const doc = { name, email, phone: phone || null, specialties: Array.isArray(specialties) ? specialties : ('' + specialties).split(',').map(s => s.trim()).filter(Boolean), bio, profileImage, rating: Number(rating) || 0, active: !!active, createdAt: new Date(), updatedAt: new Date() };
     const result = await collection.insertOne(doc);
     res.status(201).json({ success: true, insertedId: result.insertedId });
   } catch (err) {
@@ -690,9 +832,9 @@ app.patch('/decorators/:id', verifyToken, requireAdmin, async (req, res) => {
     const update = req.body;
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid id' });
     // only allow these fields to be updated
-    const allowed = ['name','email','phone','specialties','bio','profileImage','rating','active'];
+    const allowed = ['name', 'email', 'phone', 'specialties', 'bio', 'profileImage', 'rating', 'active'];
     const setObj = {};
-    for (const k of allowed) if (update[k] !== undefined) setObj[k] = k === 'specialties' && typeof update[k] === 'string' ? update[k].split(',').map(s=>s.trim()).filter(Boolean) : update[k];
+    for (const k of allowed) if (update[k] !== undefined) setObj[k] = k === 'specialties' && typeof update[k] === 'string' ? update[k].split(',').map(s => s.trim()).filter(Boolean) : update[k];
     if (Object.keys(setObj).length === 0) return res.status(400).json({ success: false, message: 'No valid fields to update' });
     setObj.updatedAt = new Date();
 
