@@ -11,15 +11,14 @@ app.use(express.json());
 app.use(
   cors({
     origin: [
-      "http://localhost:5173", // Vite
-      "http://localhost:3000", // CRA (optional)
+      "http://localhost:5173",
+      "http://localhost:3000"
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-
 const port = process.env.PORT || 8000;
 app.get('/', (req, res) => {
   res.status(200).send("connect to the server")
@@ -292,35 +291,43 @@ app.post("/payments", verifyToken, async (req, res) => {
   try {
     const payment = req.body;
 
-    // Basic validation
-    if (
-      !payment.serviceId ||
-      !payment.amount ||
-      !payment.customerName ||
-      !payment.customerEmail ||
-      !payment.paymentMethod
-    ) {
+    // Better error reporting
+    const missing = [];
+    if (!payment.serviceId) missing.push("serviceId");
+    if (!payment.amount) missing.push("amount");
+    if (!payment.customerName) missing.push("customerName");
+    if (!payment.customerEmail) missing.push("customerEmail");
+    if (!payment.paymentMethod) missing.push("paymentMethod");
+
+    if (missing.length > 0) {
       return res.status(400).json({
         success: false,
-        message: "Missing required payment fields",
+        message: `Missing required fields: ${missing.join(", ")}`,
+        received: payment // helpful for debugging
+      });
+    }
+
+    // Validate ObjectId format
+    if (!/^[0-9a-fA-F]{24}$/.test(payment.serviceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid serviceId format. Must be a valid MongoDB ObjectId.",
       });
     }
 
     const paymentsCollection = db.collection("payments");
 
-    // Persist bookingDate if provided (expects YYYY-MM-DD string)
-    const bookingDate = payment.bookingDate ? String(payment.bookingDate) : null;
-
     const paymentData = {
       serviceId: new ObjectId(payment.serviceId),
-      serviceName: payment.serviceName,
-      amount: payment.amount,
+      serviceName: payment.serviceName || "Unnamed Service",
+      amount: Number(payment.amount),
       customerName: payment.customerName,
       customerEmail: payment.customerEmail,
-      phone: payment.phone,
+      phone: payment.phone || null,
       paymentMethod: payment.paymentMethod,
-      bookingDate, // stored as YYYY-MM-DD string or null
-      status: "paid",
+      bookingDate: payment.bookingDate || null,
+      status: "unpaid",
+      progress: 0,
       createdAt: new Date(),
     };
 
@@ -328,15 +335,194 @@ app.post("/payments", verifyToken, async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Payment successful",
+      message: "Payment record created successfully",
       paymentId: result.insertedId,
+      data: paymentData,
     });
   } catch (err) {
     console.error("Payment error:", err);
-
     res.status(500).json({
       success: false,
       message: "Internal Server Error: Payment failed",
+      error: err.message,
+    });
+  }
+});
+// Get unpaid payments
+app.get("/payments/unpaid", verifyToken, async (req, res) => {
+  try {
+    const userEmail = req.user.email
+    const query = {
+      status: "unpaid",
+      customerEmail: userEmail
+    };
+    const payments = await db
+      .collection("payments")
+      .find(query)
+      .sort({ createdAt: -1 }) // optional: latest first
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      message: "Unpaid payments retrieved successfully",
+      count: payments.length,
+      data: payments,
+    });
+  } catch (error) {
+    console.error("Error fetching unpaid payments:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to get unpaid payments",
+    });
+  }
+});
+
+// PATCH route to update payment status from unpaid to paid
+app.patch('/payments/:id/status-to-paid', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate ObjectId
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment ID format'
+      });
+    }
+
+    const paymentsCollection = db.collection('payments');
+
+    // Find the payment
+    const payment = await paymentsCollection.findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment not found'
+      });
+    }
+
+    // Check if payment is already paid
+    if (payment.status === 'paid') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment is already marked as paid',
+        data: payment
+      });
+    }
+
+    // Only allow unpaid to paid transition
+    if (payment.status !== 'unpaid') {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot update payment from '${payment.status}' to 'paid'. Only 'unpaid' payments can be updated.`
+      });
+    }
+
+    // Check authorization - allow admin or the customer who made the payment
+    const userEmail = req.user.email;
+    if (userEmail !== payment.customerEmail) {
+      // Check if user is admin
+      const usersCollection = db.collection('users');
+      const user = await usersCollection.findOne({ email: userEmail });
+      if (!user || user.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to update this payment'
+        });
+      }
+    }
+
+    // Update payment status to paid
+    const updateData = {
+      status: 'paid',
+      paymentDate: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Optional: Add Stripe payment ID if provided in request body
+    if (req.body.stripePaymentId) {
+      updateData.stripePaymentId = req.body.stripePaymentId;
+    }
+
+    // Optional: Add payment method if provided
+    if (req.body.paymentMethod) {
+      updateData.paymentMethod = req.body.paymentMethod;
+    }
+
+    const result = await paymentsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment not found or already updated'
+      });
+    }
+
+    // Get updated payment
+    const updatedPayment = await paymentsCollection.findOne({
+      _id: new ObjectId(id)
+    });
+
+    // Optional: Update service booking count
+    if (payment.serviceId) {
+      await db.collection('decoration_service').updateOne(
+        { _id: payment.serviceId },
+        { $inc: { bookingCount: 1 } }
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Payment status updated to paid successfully',
+      data: updatedPayment
+    });
+
+  } catch (err) {
+    console.error('Error updating payment status:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update payment status',
+      error: err.message
+    });
+  }
+});
+//delete the  booking
+app.delete("/bookings/:id", verifyToken, async (req, res) => {
+  try {
+    const bookingId = req.params.id;
+    const userEmail = req.user.email;
+    console.log(bookingId, userEmail);
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID" });
+    }
+
+    const result = await db.collection("payments").deleteOne({
+      serviceId: new ObjectId(bookingId),
+      customerEmail: userEmail, // 🔐 ownership check
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found or unauthorized",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Booking cancelled successfully",
+    });
+  } catch (error) {
+    console.error("Cancel booking error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to cancel booking",
     });
   }
 });
@@ -459,6 +645,7 @@ app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     let { status } = req.body;
+    console.log(req.body);
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid booking id' });
     if (!status) return res.status(400).json({ success: false, message: 'Missing status' });
 
@@ -507,7 +694,11 @@ app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
 
     console.log('Booking status update request:', { id, prevStatus, status, progress: updates.progress, requester: requesterEmail, assigned: assignedEmail });
 
-    const result = await bookingsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updates });
+    const result = await bookingsCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
 
     // Return the updated booking document for confirmation
     const updated = await bookingsCollection.findOne({ _id: new ObjectId(id) });
