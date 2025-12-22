@@ -4,7 +4,7 @@ Server/node_modules
 *.json
 !package.json
 node_modules/
-
+!vercel.json
 !package-lock.json
 .vercel
 styledecor-45ebb-firebase-adminsdk-fbsvc-2cb7ac5bb5.json

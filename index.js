@@ -72,7 +72,7 @@ async function connectDB() {
         },
         { upsert: true }
       );
-      console.log(`👑 Admin user verified: ${initAdminEmail}`);
+      // console.log(`👑 Admin user verified: ${initAdminEmail}`);
     }
 
   } catch (error) {
@@ -1158,6 +1158,9 @@ app.delete('/decorators/:id', verifyToken, requireAdmin, async (req, res) => {
   }
 });
 
+// app.listen(port, () => {
+//   console.log("serveris running");
+// })
 // ---------------------------------------------------------------------
 // Vercel Export (MUST await clientPromise)
 // ---------------------------------------------------------------------
