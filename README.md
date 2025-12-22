@@ -1,6 +1,6 @@
-# StyleDecor-server# ( সহজ সরল সিম্পল ) ASSIGNMENT-010  
+# StyleDecor-server# ( সহজ সরল সিম্পল ) ASSIGNMENT-011  
 **Project: Smart Home & Ceremony Decoration Booking System – Backend API**  
-*Server for Utility Bill Management App* – Programming Hero
+
 
 ---
 
@@ -51,7 +51,7 @@ https://github.com/shahneouj/StyleDecor-server
 
 ## Live Link
 
-https://bill-manage.vercel.app/
+https://styledecor-45ebb.firebaseapp.com/
 
 ## License
 
