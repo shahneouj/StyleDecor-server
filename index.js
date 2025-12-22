@@ -5,7 +5,7 @@ const { MongoClient, ObjectId } = require('mongodb');
 const admin = require('firebase-admin');
 
 dotenv.config();  // Load .env
-
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 app.use(express.json());
 app.use(
@@ -287,9 +287,11 @@ app.delete('/services/:id', verifyToken, requireAdmin, async (req, res) => {
   }
 });
 // Create a payment
+// Create a payment (updated with Stripe support)
 app.post("/payments", verifyToken, async (req, res) => {
   try {
     const payment = req.body;
+    console.log('Payment data received:', payment);
 
     // Better error reporting
     const missing = [];
@@ -303,7 +305,7 @@ app.post("/payments", verifyToken, async (req, res) => {
       return res.status(400).json({
         success: false,
         message: `Missing required fields: ${missing.join(", ")}`,
-        received: payment // helpful for debugging
+        received: payment
       });
     }
 
@@ -317,6 +319,10 @@ app.post("/payments", verifyToken, async (req, res) => {
 
     const paymentsCollection = db.collection("payments");
 
+    // Check if this is a Stripe payment with paymentIntentId
+    const status = payment.paymentIntentId ? 'paid' : 'unpaid';
+    const stripePaymentId = payment.paymentIntentId || null;
+
     const paymentData = {
       serviceId: new ObjectId(payment.serviceId),
       serviceName: payment.serviceName || "Unnamed Service",
@@ -325,17 +331,31 @@ app.post("/payments", verifyToken, async (req, res) => {
       customerEmail: payment.customerEmail,
       phone: payment.phone || null,
       paymentMethod: payment.paymentMethod,
+      stripePaymentId: stripePaymentId,
+      progress_status: '',
       bookingDate: payment.bookingDate || null,
-      status: "unpaid",
+      status: status,
       progress: 0,
       createdAt: new Date(),
+      paymentDate: status === 'paid' ? new Date() : null,
     };
 
     const result = await paymentsCollection.insertOne(paymentData);
 
+    // If this was a successful Stripe payment, also update the service to track bookings
+    if (status === 'paid') {
+      // Optionally increment booking count on the service
+      await db.collection('decoration_service').updateOne(
+        { _id: new ObjectId(payment.serviceId) },
+        { $inc: { bookingCount: 1 } }
+      );
+    }
+
     res.status(201).json({
       success: true,
-      message: "Payment record created successfully",
+      message: status === 'paid'
+        ? "Payment completed successfully"
+        : "Payment record created successfully",
       paymentId: result.insertedId,
       data: paymentData,
     });
@@ -373,6 +393,45 @@ app.get("/payments/unpaid", verifyToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to get unpaid payments",
+    });
+  }
+});
+// Create a Payment Intent for Stripe
+app.post('/create-payment-intent', verifyToken, async (req, res) => {
+  try {
+    const { amount, currency = 'usd', metadata = {} } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid amount is required'
+      });
+    }
+
+    // Convert amount to cents (Stripe uses smallest currency unit)
+    const amountInCents = Math.round(amount * 100);
+
+    // Create Payment Intent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: currency,
+      metadata: metadata,
+      automatic_payment_methods: {
+        enabled: true,
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+    });
+  } catch (err) {
+    console.error('Stripe Payment Intent Error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create payment intent',
+      error: err.message
     });
   }
 });
