@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient, ObjectId, CURSOR_FLAGS } = require('mongodb');
 const admin = require('firebase-admin');
 
 dotenv.config();  // Load .env
@@ -32,68 +32,47 @@ async function connectDB() {
     await client.connect();
 
     db = client.db('StyleDecor_db');
-
     console.log("✅ Database connected");
 
-    let firebaseInitialized = false;
-
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // --- Firebase Initialization ---
+    if (!admin.apps.length) {
       try {
-        let raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-        let serviceAccount;
-        // Try parse as JSON
-        try {
-          serviceAccount = JSON.parse(raw);
-        } catch (e) {
-          // Try base64 decode then parse
-          try {
-            const decoded = Buffer.from(raw, 'base64').toString('utf8');
-            serviceAccount = JSON.parse(decoded);
-          } catch (err2) {
-            throw new Error('FIREBASE_SERVICE_ACCOUNT is set but not valid JSON or base64-encoded JSON');
-          }
+        if (!process.env.FB_SERVICE_KEY) {
+          throw new Error("FB_SERVICE_KEY environment variable is missing");
         }
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-        console.log('✅ Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT');
-        firebaseInitialized = true;
-      } catch (err) {
-        console.warn('⚠️ Failed to initialize Firebase Admin from FIREBASE_SERVICE_ACCOUNT:', err.message);
+
+        const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf8");
+        const serviceAccount = JSON.parse(decoded);
+
+        // Fix for multiline private keys in Vercel/Environment variables
+        if (serviceAccount.private_key) {
+          serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
+
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount),
+        });
+        console.log("✅ Firebase initialized successfully");
+      } catch (error) {
+        console.error("❌ Firebase initialization failed:", error.message);
       }
+    } else {
+      admin.app();
     }
 
-    if (!firebaseInitialized && process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-      try {
-        const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-        console.log('✅ Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT_PATH');
-        firebaseInitialized = true;
-      } catch (err) {
-        console.warn('⚠️ Failed to initialize Firebase Admin from path:', err.message);
-      }
-    }
-
-    if (!firebaseInitialized) {
-      // Try the project-local file as a last resort (existing behavior)
-      try {
-        const serviceAccount = require("./styledecor-45ebb-firebase-adminsdk-fbsvc-2cb7ac5bb5.json");
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-        console.log('✅ Firebase Admin initialized from local service account file');
-        firebaseInitialized = true;
-      } catch (err) {
-        console.warn('⚠️ Firebase Admin not initialized. Token verification disabled. To enable, set FIREBASE_SERVICE_ACCOUNT (JSON/base64) or FIREBASE_SERVICE_ACCOUNT_PATH.');
-      }
-    }
-
-    // If INIT_ADMIN_EMAIL set, ensure that user exists and is admin
+    // --- Initial Admin Setup ---
     const initAdminEmail = process.env.INIT_ADMIN_EMAIL;
     if (initAdminEmail) {
       const usersCollection = db.collection('users');
       await usersCollection.updateOne(
         { email: initAdminEmail },
-        { $set: { role: 'admin', updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+        {
+          $set: { role: 'admin', updatedAt: new Date() },
+          $setOnInsert: { createdAt: new Date() }
+        },
         { upsert: true }
       );
-      console.log(`✅ Initial admin ensured: ${initAdminEmail}`);
+      console.log(`👑 Admin user verified: ${initAdminEmail}`);
     }
 
   } catch (error) {
@@ -408,8 +387,16 @@ app.post('/create-payment-intent', verifyToken, async (req, res) => {
       });
     }
 
-    // Convert amount to cents (Stripe uses smallest currency unit)
-    const amountInCents = Math.round(amount * 100);
+    // Convert amount to cents
+    const amountInCents = Math.round(amount);
+
+    // FIX: Check against Stripe's maximum limit ($999,999.99)
+    if (amountInCents > 99999999) {
+      return res.status(400).json({
+        success: false,
+        message: 'Amount exceeds maximum allowable payment ($999,999.99)'
+      });
+    }
 
     // Create Payment Intent
     const paymentIntent = await stripe.paymentIntents.create({
@@ -431,7 +418,7 @@ app.post('/create-payment-intent', verifyToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to create payment intent',
-      error: err.message
+      error: err.message // This will now only catch unexpected errors
     });
   }
 });
@@ -453,7 +440,7 @@ app.patch('/payments/:id/status-to-paid', verifyToken, async (req, res) => {
 
     // Find the payment
     const payment = await paymentsCollection.findOne({
-      _id: new ObjectId(id)
+      serviceId: new ObjectId(id)
     });
 
     if (!payment) {
@@ -512,7 +499,7 @@ app.patch('/payments/:id/status-to-paid', verifyToken, async (req, res) => {
     }
 
     const result = await paymentsCollection.updateOne(
-      { _id: new ObjectId(id) },
+      { serviceId: new ObjectId(id) },
       { $set: updateData }
     );
 
@@ -671,7 +658,7 @@ app.patch('/bookings/:id/assign', verifyToken, requireAdmin, async (req, res) =>
     if (!decorator) return res.status(404).json({ success: false, message: 'Decorator not found' });
 
     const bookingsCollection = db.collection('payments');
-    const updates = { assignedDecorator: { id: decorator._id, name: decorator.name, email: decorator.email }, assignedAt: new Date(), status: 'assigned', progress: 0, updatedAt: new Date() };
+    const updates = { assignedDecorator: { id: decorator._id, name: decorator.name, email: decorator.email }, assignedAt: new Date(), progress_status: 'assigned', progress: 0, updatedAt: new Date() };
     const result = await bookingsCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: updates }
@@ -703,15 +690,15 @@ app.get('/bookings/assigned', verifyToken, async (req, res) => {
 app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
-    let { status } = req.body;
+    let { progress_status } = req.body;
     console.log(req.body);
     if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid booking id' });
-    if (!status) return res.status(400).json({ success: false, message: 'Missing status' });
+    if (!progress_status) return res.status(400).json({ success: false, message: 'Missing status' });
 
     // normalize status and validate (accept hyphen or underscore)
-    status = String(status).trim().toLowerCase().replace(/-/g, '_');
+    progress_status = String(progress_status).trim().toLowerCase().replace(/-/g, '_');
     const allowedStatuses = ['assigned', 'in_progress', 'completed', 'cancelled'];
-    if (!allowedStatuses.includes(status)) return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${allowedStatuses.join(', ')}` });
+    if (!allowedStatuses.includes(progress_status)) return res.status(400).json({ success: false, message: `Invalid status. Allowed: ${allowedStatuses.join(', ')}` });
 
     const bookingsCollection = db.collection('payments');
     const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
@@ -730,9 +717,9 @@ app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
     }
     if (!allowed) return res.status(403).json({ success: false, message: 'Not authorized to update this booking' });
 
-    const prevStatus = booking.status;
+    const prevStatus = booking.progress_status;
 
-    const updates = { status, statusUpdatedAt: new Date(), updatedAt: new Date() };
+    const updates = { progress_status, statusUpdatedAt: new Date(), updatedAt: new Date() };
 
     // Accept explicit progress percent (0-100) if provided
     let progress = undefined;
@@ -743,15 +730,15 @@ app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
       updates.progress = progress;
     } else {
       // set sensible defaults when status changes
-      if (status === 'assigned') updates.progress = 0;
-      else if (status === 'in_progress') updates.progress = booking?.progress ? booking.progress : 50;
-      else if (status === 'completed') updates.progress = 100;
+      if (progress_status === 'assigned' || progress_status === '') updates.progress = 0;
+      else if (progress_status === 'in_progress') updates.progress = booking?.progress ? booking.progress : 50;
+      else if (progress_status === 'completed') updates.progress = 100;
     }
 
-    if (status === 'completed') updates.completedAt = new Date();
-    if (status === 'in_progress' && !booking.startedAt) updates.startedAt = new Date();
+    if (progress_status === 'completed') updates.completedAt = new Date();
+    if (progress_status === 'in_progress' && !booking.startedAt) updates.startedAt = new Date();
 
-    console.log('Booking status update request:', { id, prevStatus, status, progress: updates.progress, requester: requesterEmail, assigned: assignedEmail });
+    console.log('Booking status update request:', { id, prevStatus, progress_status, progress: updates.progress, requester: requesterEmail, assigned: assignedEmail });
 
     const result = await bookingsCollection.findOneAndUpdate(
       { _id: new ObjectId(id) },
@@ -773,7 +760,67 @@ app.patch('/bookings/:id/status', verifyToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Could not update booking status' });
   }
 });
+// revenue
+app.get('/analytics/revenue-summary', verifyToken, async (req, res) => {
+  try {
+    const paymentsCollection = db.collection('payments');
 
+    const result = await paymentsCollection.aggregate([
+      {
+        // Only count "Paid" bookings (where paymentDate exists)
+        $match: { paymentDate: { $exists: true, $ne: null } }
+      },
+      {
+        $group: {
+          _id: null, // Group everything into one object
+          totalRevenue: { $sum: "$amount" },
+          totalBookings: { $sum: 1 }
+        }
+      },
+      {
+        $project: { _id: 0, totalRevenue: 1, totalBookings: 1 }
+      }
+    ]).toArray();
+
+    // Handle empty database case
+    const data = result[0] || { totalRevenue: 0, totalBookings: 0 };
+
+    res.status(200).json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 2. Service Demand - Chart Data
+app.get('/analytics/service-demand', verifyToken, async (req, res) => {
+  try {
+    const paymentsCollection = db.collection('payments');
+
+    const demand = await paymentsCollection.aggregate([
+      {
+        $match: { paymentDate: { $exists: true, $ne: null } }
+      },
+      {
+        $group: {
+          _id: "$serviceName", // Group by the service name
+          bookingsCount: { $sum: 1 } // Recharts expects this key
+        }
+      },
+      {
+        $project: {
+          serviceName: "$_id", // Rename _id to serviceName for the chart
+          bookingsCount: 1,
+          _id: 0
+        }
+      },
+      { $sort: { bookingsCount: -1 } } // Popular services first
+    ]).toArray();
+
+    res.status(200).json({ success: true, data: demand });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 // Create or update a user (upsert) — intended to be called after registration
 app.post('/users', async (req, res) => {
   try {
@@ -1111,6 +1158,10 @@ app.delete('/decorators/:id', verifyToken, requireAdmin, async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log("🚀 Server running on port", port);
-});
+// ---------------------------------------------------------------------
+// Vercel Export (MUST await clientPromise)
+// ---------------------------------------------------------------------
+module.exports = async (req, res) => {
+  await clientPromise; // now defined and works
+  app(req, res);
+};
